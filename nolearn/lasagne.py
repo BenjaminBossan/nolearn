@@ -97,7 +97,8 @@ def get_real_filter(layers, img_size):
             real_filter[j] = img_size
             continue
 
-        if isinstance(layer, Conv2DLayer):
+        if (isinstance(layer, Conv2DLayer) or
+            isinstance(layer, Conv2DCCLayer)):
             if not first_conv_layer:
                 new_filter = np.array(layer.filter_size) * expon
                 real_filter[j] = new_filter
@@ -137,7 +138,8 @@ def get_receptive_field(layers, img_size):
             receptive_field[j] = img_size
             continue
 
-        if isinstance(layer, Conv2DLayer):
+        if (isinstance(layer, Conv2DLayer) or
+            isinstance(layer, Conv2DCCLayer)):
             if not first_conv_layer:
                 last_field = receptive_field[i]
                 new_field = (last_field + expon *
