@@ -775,9 +775,11 @@ def occlusion_heatmap(net, x, y, square_length=7):
     overfitting.
 
     Depending on the depth of the net and the size of the image, this
-    function may take awhile to finish.
+    function may take awhile to finish, since one prediction for each
+    pixel of the image is made.
 
-    Currently, all color channels are occluded at the same time.
+    Currently, all color channels are occluded at the same time. Also,
+    this does not really work if images are randomly distorted.
 
     See paper: Zeiler, Fergus 2013
 
@@ -811,12 +813,16 @@ def occlusion_heatmap(net, x, y, square_length=7):
     shape = x.shape
     heat_array = np.zeros(shape[2:])
     pad = square_length // 2
+    x_occluded = np.zeros((shape[2] * shape[3], 1, shape[2], shape[3]),
+                          dtype=img.dtype)
     for i, j in it.product(*map(range, shape[2:])):
         x_padded = np.pad(img, ((0, 0), (pad, pad), (pad, pad)), 'constant')
         x_padded[:, i:i + square_length, j:j + square_length] = 0.
-        x_occluded = x_padded[:, pad:-pad, pad:-pad]
-        prob = net.predict_proba(x_occluded.reshape(1, 1, shape[2], shape[3]))
-        heat_array[i, j] = prob[0, y.astype(int)]
+        x_occluded[i * shape[0] + j, 0] = x_padded[:, pad:-pad, pad:-pad]
+
+    probs = net.predict_proba(x_occluded)
+    for i, j in it.product(*map(range, shape[2:])):
+        heat_array[i, j] = probs[i * shape[0] + j, y.astype(int)]
     return heat_array
 
 
