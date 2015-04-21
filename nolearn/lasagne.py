@@ -772,6 +772,9 @@ def occlusion_heatmap(net, x, y, square_length=7):
     critical parts of the image are occluded. If not, this indicates
     overfitting.
 
+    Depending on the depth of the net and the size of the image, this
+    function may take awhile to finish.
+
     Currently, all color channels are occluded at the same time.
 
     See paper: Zeiler, Fergus 2013
@@ -811,7 +814,7 @@ def occlusion_heatmap(net, x, y, square_length=7):
         x_padded[:, i:i + square_length, j:j + square_length] = 0.
         x_occluded = x_padded[:, pad:-pad, pad:-pad]
         prob = net.predict_proba(x_occluded.reshape(1, 1, shape[2], shape[3]))
-        heat_array[i, j] = prob[0, y]
+        heat_array[i, j] = prob[0, y.astype(int)]
     return heat_array
 
 
