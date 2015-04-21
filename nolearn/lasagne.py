@@ -2,17 +2,20 @@ from __future__ import absolute_import
 
 from ._compat import pickle
 from collections import OrderedDict
-import functools
-import itertools
-import operator
+from difflib import SequenceMatcher
+import itertools as it
+import operator as op
 from time import time
 import pdb
 
+from lasagne.layers import Conv2DLayer
+from lasagne.layers import MaxPool2DLayer
 from lasagne.objectives import categorical_crossentropy
 from lasagne.objectives import mse
 from lasagne.objectives import Objective
 from lasagne.updates import nesterov_momentum
 from lasagne.utils import unique
+import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.cross_validation import KFold
@@ -20,8 +23,15 @@ from sklearn.cross_validation import StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import LabelEncoder
+from tabulate import tabulate
 import theano
 from theano import tensor as T
+try:
+    from lasagne.layers.cuda_convnet import Conv2DCCLayer
+    from lasagne.layers.cuda_convnet import MaxPool2DCCLayer
+except ImportError:
+    Conv2DCCLayer = Conv2DLayer
+    MaxPool2DCCLayer = MaxPool2DLayer
 
 
 class _list(list):
@@ -35,7 +45,10 @@ class _dict(dict):
 
 class ansi:
     BLUE = '\033[94m'
+    CYAN = '\033[36m'
     GREEN = '\033[32m'
+    MAGENTA = '\033[35m'
+    RED = '\033[31m'
     ENDC = '\033[0m'
 
 
@@ -63,6 +76,141 @@ class BatchIterator(object):
         return Xb, yb
 
 
+def get_real_filter(layers, img_size):
+    """Get the real filter sizes of each layer involved in
+    convoluation. See Xudong Cao:
+    https://www.kaggle.com/c/datasciencebowl/forums/t/13166/happy-lantern-festival-report-and-code
+
+    This does not yet take into consideration feature pooling,
+    padding, striding and similar gimmicks.
+
+    """
+    # imports here to prevent circular dependencies
+    real_filter = np.zeros((len(layers), 2))
+    conv_mode = True
+    first_conv_layer = True
+    expon = np.ones((1, 2))
+
+    for i, layer in enumerate(layers[1:]):
+        j = i + 1
+        if not conv_mode:
+            real_filter[j] = img_size
+            continue
+
+        if isinstance(layer, Conv2DLayer):
+            if not first_conv_layer:
+                new_filter = np.array(layer.filter_size) * expon
+                real_filter[j] = new_filter
+            else:
+                new_filter = np.array(layer.filter_size) * expon
+                real_filter[j] = new_filter
+                first_conv_layer = False
+        elif (isinstance(layer, MaxPool2DLayer) or
+              isinstance(layer, MaxPool2DCCLayer)):
+            real_filter[j] = real_filter[i]
+            expon *= np.array(layer.ds)
+        else:
+            conv_mode = False
+            real_filter[j] = img_size
+
+    real_filter[0] = img_size
+    return real_filter
+
+
+def get_receptive_field(layers, img_size):
+    """Get the real filter sizes of each layer involved in
+    convoluation. See Xudong Cao:
+    https://www.kaggle.com/c/datasciencebowl/forums/t/13166/happy-lantern-festival-report-and-code
+
+    This does not yet take into consideration feature pooling,
+    padding, striding and similar gimmicks.
+
+    """
+    receptive_field = np.zeros((len(layers), 2))
+    conv_mode = True
+    first_conv_layer = True
+    expon = np.ones((1, 2))
+
+    for i, layer in enumerate(layers[1:]):
+        j = i + 1
+        if not conv_mode:
+            receptive_field[j] = img_size
+            continue
+
+        if isinstance(layer, Conv2DLayer):
+            if not first_conv_layer:
+                last_field = receptive_field[i]
+                new_field = (last_field + expon *
+                             (np.array(layer.filter_size) - 1))
+                receptive_field[j] = new_field
+            else:
+                receptive_field[j] = layer.filter_size
+                first_conv_layer = False
+        elif (isinstance(layer, MaxPool2DLayer) or
+              isinstance(layer, MaxPool2DCCLayer)):
+            receptive_field[j] = receptive_field[i]
+            expon *= np.array(layer.ds)
+        else:
+            conv_mode = False
+            receptive_field[j] = img_size
+
+    receptive_field[0] = img_size
+    return receptive_field
+
+
+def get_conv_infos(net, min_capacity=100. / 6, tablefmt='pipe',
+                   detailed=False):
+    CYA = ansi.CYAN
+    END = ansi.ENDC
+    MAG = ansi.MAGENTA
+    RED = ansi.RED
+
+    layers = net.layers_.values()
+    img_size = net.layers_['input'].get_output_shape()[2:]
+
+    header = ['name', 'size', 'total', 'cap. Y [%]', 'cap. X [%]',
+              'cov. Y [%]', 'cov. X [%]']
+    if detailed:
+        header += ['filter Y', 'filter X', 'field Y', 'field X']
+
+    shapes = [layer.get_output_shape()[1:] for layer in layers]
+    totals = [str(reduce(op.mul, shape)) for shape in shapes]
+    shapes = ['x'.join(map(str, shape)) for shape in shapes]
+    shapes = np.array(shapes).reshape(-1, 1)
+    totals = np.array(totals).reshape(-1, 1)
+
+    real_filters = get_real_filter(layers, img_size)
+    receptive_fields = get_receptive_field(layers, img_size)
+    capacity = 100. * real_filters / receptive_fields
+    capacity[np.negative(np.isfinite(capacity))] = 1
+    img_coverage = 100. * receptive_fields / img_size
+    layer_names = [layer.name if layer.name
+                   else str(layer).rsplit('.')[-1].split(' ')[0]
+                   for layer in layers]
+
+    colored_names = []
+    for name, (covy, covx), (capy, capx) in zip(
+            layer_names, img_coverage, capacity):
+        if (
+                ((covy > 100) or (covx > 100)) and
+                ((capy < min_capacity) or (capx < min_capacity))
+        ):
+            name = "{}{}{}".format(RED, name, END)
+        elif (covy > 100) or (covx > 100):
+            name = "{}{}{}".format(CYA, name, END)
+        elif (capy < min_capacity) or (capx < min_capacity):
+            name = "{}{}{}".format(MAG, name, END)
+        colored_names.append(name)
+    colored_names = np.array(colored_names).reshape(-1, 1)
+
+    table = np.hstack((colored_names, shapes, totals, capacity, img_coverage))
+    if detailed:
+        table = np.hstack((table, real_filters.astype(int),
+                           receptive_fields.astype(int)))
+
+    return tabulate(table, header, tablefmt=tablefmt, floatfmt='.2f')
+
+
 class NeuralNet(BaseEstimator):
     """A scikit-learn estimator based on Lasagne.
     """
@@ -78,6 +226,7 @@ class NeuralNet(BaseEstimator):
         regression=False,
         max_epochs=100,
         eval_size=0.2,
+        custom_score=None,
         X_tensor_type=None,
         y_tensor_type=None,
         use_label_encoder=False,
@@ -114,6 +263,7 @@ class NeuralNet(BaseEstimator):
         self.regression = regression
         self.max_epochs = max_epochs
         self.eval_size = eval_size
+        self.custom_score = custom_score
         self.X_tensor_type = X_tensor_type
         self.y_tensor_type = y_tensor_type
         self.use_label_encoder = use_label_encoder
@@ -153,8 +303,6 @@ class NeuralNet(BaseEstimator):
         out = getattr(self, '_output_layer', None)
         if out is None:
             out = self._output_layer = self.initialize_layers()
-        if self.verbose:
-            self._print_layer_info(self.layers_.values())
 
         iter_funcs = self._create_iter_funcs(
             self.layers_, self.objective, self.update,
@@ -164,6 +312,9 @@ class NeuralNet(BaseEstimator):
         self.train_iter_, self.eval_iter_, self.predict_iter_ = iter_funcs
         self._initialized = True
 
+        if self.verbose:
+            self._print_layer_info()
+
     def _get_params_for(self, name):
         collected = {}
         prefix = '{}_'.format(name)
@@ -171,7 +322,7 @@ class NeuralNet(BaseEstimator):
         params = vars(self)
         more_params = self.more_params
 
-        for key, value in itertools.chain(params.items(), more_params.items()):
+        for key, value in it.chain(params.items(), more_params.items()):
             if key.startswith(prefix):
                 collected[key[len(prefix):]] = value
 
@@ -281,15 +432,16 @@ class NeuralNet(BaseEstimator):
             on_training_finished = [on_training_finished]
 
         epoch = 0
-        info = None
-        best_valid_loss = np.inf
-        best_train_loss = np.inf
-
-        if self.verbose:
-            print("""
- Epoch  |  Train loss  |  Valid loss  |  Train / Val  |  Valid acc  |  Dur
---------|--------------|--------------|---------------|-------------|-------\
-""")
+        best_valid_loss = (
+            min([row['valid loss'] for row in self.train_history_]) if
+            self.train_history_ else np.inf
+            )
+        best_train_loss = (
+            min([row['train loss'] for row in self.train_history_]) if
+            self.train_history_ else np.inf
+            )
+        first_iteration = True
+        num_epochs_past = len(self.train_history_)
 
         while epoch < self.max_epochs:
             epoch += 1
@@ -297,6 +449,7 @@ class NeuralNet(BaseEstimator):
             train_losses = []
             valid_losses = []
             valid_accuracies = []
+            custom_score = []
 
             t0 = time()
 
@@ -308,41 +461,45 @@ class NeuralNet(BaseEstimator):
                 batch_valid_loss, accuracy = self.eval_iter_(Xb, yb)
                 valid_losses.append(batch_valid_loss)
                 valid_accuracies.append(accuracy)
+                if self.custom_score:
+                    y_prob = self.predict_iter_(Xb)
+                    custom_score.append(self.custom_score[1](yb, y_prob))
 
             avg_train_loss = np.mean(train_losses)
             avg_valid_loss = np.mean(valid_losses)
             avg_valid_accuracy = np.mean(valid_accuracies)
+            if custom_score:
+                avg_custom_score = np.mean(custom_score)
 
             if avg_train_loss < best_train_loss:
                 best_train_loss = avg_train_loss
             if avg_valid_loss < best_valid_loss:
                 best_valid_loss = avg_valid_loss
+            best_train_loss == avg_train_loss
+            best_valid = best_valid_loss == avg_valid_loss
 
-            if self.verbose:
-                best_train = best_train_loss == avg_train_loss
-                best_valid = best_valid_loss == avg_valid_loss
-                print(" {:>5}  |  {}{:>10.6f}{}  |  {}{:>10.6f}{}  "
-                      "|  {:>11.6f}  |  {:>9}  |  {:>3.1f}s".format(
-                          epoch,
-                          ansi.BLUE if best_train else "",
-                          avg_train_loss,
-                          ansi.ENDC if best_train else "",
-                          ansi.GREEN if best_valid else "",
-                          avg_valid_loss,
-                          ansi.ENDC if best_valid else "",
-                          avg_train_loss / avg_valid_loss,
-                          "{:.2f}%".format(avg_valid_accuracy * 100)
-                          if not self.regression else "",
-                          time() - t0,
-                          ))
+            info = OrderedDict([
+                ('epoch', num_epochs_past + epoch),
+                ('train loss', avg_train_loss),
+                ('valid loss', avg_valid_loss),
+                ('valid best', avg_valid_loss if best_valid else None),
+                ('train/val', avg_train_loss / avg_valid_loss),
+                ('valid acc', avg_valid_accuracy),
+                ])
+            if self.custom_score:
+                info.update({self.custom_score[0]: avg_custom_score})
+            info.update({'dur': time() - t0})
 
-            info = dict(
-                epoch=epoch,
-                train_loss=avg_train_loss,
-                valid_loss=avg_valid_loss,
-                valid_accuracy=avg_valid_accuracy,
-                )
             self.train_history_.append(info)
+            self.log_ = tabulate(self.train_history_, headers='keys',
+                                 tablefmt='pipe', floatfmt='.4f')
+            if self.verbose:
+                if first_iteration:
+                    print(self.log_.split('\n', 2)[0])
+                    print(self.log_.split('\n', 2)[1])
+                    first_iteration = False
+                print(self.log_.rsplit('\n', 1)[-1])
+
             try:
                 for func in on_epoch_finished:
                     func(self, self.train_history_)
@@ -395,28 +552,6 @@ class NeuralNet(BaseEstimator):
         params = sum([l.get_params() for l in layers], [])
         return unique(params)
 
-    def load_weights_from(self, source):
-        self.initialize()
-
-        if isinstance(source, str):
-            source = np.load(source)
-
-        if isinstance(source, NeuralNet):
-            source = source.get_all_params()
-
-        source_weights = [
-            w.get_value() if hasattr(w, 'get_value') else w for w in source]
-
-        for w1, w2 in zip(source_weights, self.get_all_params()):
-            if w1.shape != w2.get_value().shape:
-                continue
-            w2.set_value(w1)
-
-    def save_weights_to(self, fname):
-        weights = [w.get_value() for w in self.get_all_params()]
-        with open(fname, 'wb') as f:
-            pickle.dump(weights, f, -1)
-
     def __getstate__(self):
         state = dict(self.__dict__)
         for attr in (
@@ -433,14 +568,59 @@ class NeuralNet(BaseEstimator):
         self.__dict__.update(state)
         self.initialize()
 
-    def _print_layer_info(self, layers):
-        for layer in layers:
-            output_shape = layer.get_output_shape()
-            print("  {:<18}\t{:<20}\tproduces {:>7} outputs".format(
-                layer.name,
-                str(output_shape),
-                str(functools.reduce(operator.mul, output_shape[1:])),
-                ))
+    def _print_layer_info(self):
+        shapes = [param.get_value().shape for param in
+                  self.get_all_params() if param]
+        nparams = reduce(op.add, [reduce(op.mul, shape) for
+                                  shape in shapes])
+        print("# Neural Network with {} learnable parameters"
+              "\n".format(nparams))
+        print("## Layer information")
+
+        layers = self.layers_.values()
+        has_conv2d = any([isinstance(layer, Conv2DLayer) or
+                          isinstance(layer, Conv2DCCLayer)
+                          for layer in layers])
+        if has_conv2d:
+            self._print_layer_info_conv()
+        else:
+            self._print_layer_info_plain()
+
+    def _print_layer_info_plain(self):
+        nums = range(len(self.layers))
+        names = list(zip(*self.layers))[0]
+        output_shapes = ['x'.join(map(str, layer.get_output_shape()[1:]))
+                         for layer in self.layers_.values()]
+        table = OrderedDict([
+            ('#', nums),
+            ('name', names),
+            ('size', output_shapes),
+        ])
+        self.layer_infos_ = tabulate(table, 'keys', tablefmt='pipe')
+        print(self.layer_infos_)
+        print("")
+
+    def _print_layer_info_conv(self):
+        if self.verbose > 1:
+            detailed = True
+            tablefmt = 'simple'
+        else:
+            detailed = False
+            tablefmt = 'pipe'
+
+        self.layer_infos_ = get_conv_infos(self, detailed=detailed,
+                                           tablefmt=tablefmt)
+        print(self.layer_infos_)
+        print("\nExplanation")
+        print("    X, Y:    image dimensions")
+        print("    cap.:    learning capacity")
+        print("    cov.:    coverage of image")
+        print("    {}: capacity too low (<1/6)"
+              "".format("{}{}{}".format(ansi.MAGENTA, "magenta", ansi.ENDC)))
+        print("    {}:    image coverage too high (>100%)"
+              "".format("{}{}{}".format(ansi.CYAN, "cyan", ansi.ENDC)))
+        print("    {}:     capacity too low and coverage too high\n"
+              "".format("{}{}{}".format(ansi.RED, "red", ansi.ENDC)))
 
     def get_params(self, deep=True):
         params = super(NeuralNet, self).get_params(deep=deep)
@@ -456,3 +636,233 @@ class NeuralNet(BaseEstimator):
         # This allows us to have **kwargs in __init__ (woot!):
         param_names = super(NeuralNet, self)._get_param_names()
         return param_names + self._kwarg_keys
+
+    def save_weights_to(self, fname):
+        weights = [w.get_value() for w in self.get_all_params()]
+        with open(fname, 'wb') as f:
+            pickle.dump(weights, f, -1)
+
+    @staticmethod
+    def _param_alignment(shapes0, shapes1):
+        shapes0 = list(map(str, shapes0))
+        shapes1 = list(map(str, shapes1))
+        matcher = SequenceMatcher(a=shapes0, b=shapes1)
+        matches = []
+        for block in matcher.get_matching_blocks():
+            if block.size == 0:
+                continue
+            matches.append((list(range(block.a, block.a + block.size)),
+                            list(range(block.b, block.b + block.size))))
+        result = [line for match in matches for line in zip(*match)]
+        return result
+
+    def load_weights_from(self, src):
+        if not hasattr(self, '_initialized'):
+            raise AttributeError(
+                "Please initialize the net before loading weights.")
+
+        if isinstance(src, str):
+            src = np.load(src)
+        if isinstance(src, NeuralNet):
+            src = src.get_all_params()
+
+        target = self.get_all_params()
+        src_params = [p.get_value() if hasattr(p, 'get_value') else p
+                      for p in src]
+        target_params = [p.get_value() for p in target]
+
+        src_shapes = [p.shape for p in src_params]
+        target_shapes = [p.shape for p in target_params]
+        matches = self._param_alignment(src_shapes, target_shapes)
+
+        for i, j in matches:
+            # ii, jj are the indices of the layers, assuming 2
+            # parameters per layer
+            ii, jj = int(0.5 * i) + 1, int(0.5 * j) + 1
+            target[j].set_value(src_params[i])
+
+            if not self.verbose:
+                continue
+            target_layer_name = list(self.layers_)[jj]
+            param_shape = 'x'.join(map(str, src_params[i].shape))
+            print("* Loaded parameter from layer {} to layer {} ({}) "
+                  "(shape: {})".format(ii, jj, target_layer_name, param_shape))
+
+
+def plot_loss(net):
+    train_loss = [row['train loss'] for row in net.train_history_]
+    valid_loss = [row['valid loss'] for row in net.train_history_]
+    plt.plot(train_loss, label='train loss')
+    plt.plot(valid_loss, label='valid loss')
+    plt.legend(loc='best')
+
+
+def plot_conv_weights(layer, figsize=(6, 6)):
+    """Plot the weights of a specific layer. Only really makes sense
+    with convolutional layers.
+
+    Parameters
+    ----------
+    layer : netz.layers.layer
+    """
+    W = layer.W.get_value()
+    shape = W.shape
+    nrows = np.ceil(np.sqrt(shape[0])).astype(int)
+    ncols = nrows
+    for feature_map in range(shape[1]):
+        figs, axes = plt.subplots(nrows, ncols, figsize=figsize)
+        for ax in axes.flatten():
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.axis('off')
+        for i, (r, c) in enumerate(it.product(range(nrows), range(ncols))):
+            if i >= shape[0]:
+                break
+            axes[r, c].imshow(W[i, feature_map], cmap='gray',
+                              interpolation='nearest')
+
+
+def plot_conv_activity(layer, x, figsize=(6, 8)):
+    """Plot the acitivities of a specific layer. Only really makes
+    sense with layers that work 2D data (2D convolutional layers, 2D
+    pooling layers ...)
+
+    Parameters
+    ----------
+    layer : netz.layers.layer
+
+    x : numpy.ndarray
+      Only takes one sample at a time, i.e. x.shape[0] == 1.
+
+    """
+    if x.shape[0] != 1:
+        raise ValueError("Only one sample can be plotted at a time.")
+    xs = T.tensor4('xs').astype(theano.config.floatX)
+    get_activity = theano.function([xs], layer.get_output(xs))
+    activity = get_activity(x)
+    shape = activity.shape
+    nrows = np.ceil(np.sqrt(shape[1])).astype(int)
+    ncols = nrows
+
+    figs, axes = plt.subplots(nrows + 1, ncols, figsize=figsize)
+    axes[0, ncols // 2].imshow(1 - x[0][0], cmap='gray',
+                               interpolation='nearest')
+    axes[0, ncols // 2].set_title('original')
+    for ax in axes.flatten():
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.axis('off')
+    for i, (r, c) in enumerate(it.product(range(nrows), range(ncols))):
+        if i >= shape[1]:
+            break
+        ndim = activity[0][i].ndim
+        if ndim != 2:
+            raise ValueError("Wrong number of dimensions, image data should "
+                             "have 2, instead got {}".format(ndim))
+        axes[r + 1, c].imshow(-activity[0][i], cmap='gray',
+                              interpolation='nearest')
+
+
+def occlusion_heatmap(net, x, y, square_length=7):
+    """An occlusion test that checks an image for its critical parts.
+
+    In this test, a square part of the image is occluded (i.e. set to
+    0) and then the net is tested for its propensity to predict the
+    correct label. One should expect that this propensity shrinks of
+    critical parts of the image are occluded. If not, this indicates
+    overfitting.
+
+    Currently, all color channels are occluded at the same time.
+
+    See paper: Zeiler, Fergus 2013
+
+    Parameters
+    ----------
+    net : NeuralNet instance
+      The neural net to test.
+
+    x : np.array
+      The input data, should be of shape (1, c, x, y). Only makes
+      sense with image data.
+
+    y : np.array
+      The true value of the image.
+
+    square_length : int (default=7)
+      The length of the side of the square that occludes the image.
+
+    Results
+    -------
+    heat_array : np.array (with same size as image)
+      An 2D np.array that at each point (i, j) contains the predicted
+      probability of the correct class if the image is occluded by a
+      square with center (i, j).
+
+    """
+    if (x.ndim != 4) or x.shape[0] != 1:
+        raise ValueError("This function requires the input data to be of "
+                         "shape (1, c, x, y), instead got {}".format(x.shape))
+    img = x[0].copy()
+    shape = x.shape
+    heat_array = np.zeros(shape[2:])
+    pad = square_length // 2
+    for i, j in it.product(*map(range, shape[2:])):
+        x_padded = np.pad(img, ((0, 0), (pad, pad), (pad, pad)), 'constant')
+        x_padded[:, i:i + square_length, j:j + square_length] = 0.
+        x_occluded = x_padded[:, pad:-pad, pad:-pad]
+        prob = net.predict_proba(x_occluded.reshape(1, 1, shape[2], shape[3]))
+        heat_array[i, j] = prob[0, y]
+    return heat_array
+
+
+def plot_occlusion(net, X, y, square_length=7, figsize=(9, None)):
+    """Plot which parts of an image are particularly import for the
+    net to classify the image correctly.
+
+    See paper: Zeiler, Fergus 2013
+
+    Parameters
+    ----------
+    net : NeuralNet instance
+      The neural net to test.
+
+    X : np.array
+      The input data, should be of shape (b, c, x, y). Only makes
+      sense with image data.
+
+    y : np.array
+      The true values of the images.
+
+    square_length : int (default=7)
+      The length of the side of the square that occludes the image.
+
+    figsize : tuple (int, int)
+      Size of the figure.
+
+    """
+    if (X.ndim != 4):
+        raise ValueError("This function requires the input data to be of "
+                         "shape (b, c, x, y), instead got {}".format(X.shape))
+    num_images = X.shape[0]
+    if figsize[1] is None:
+        figsize = (figsize[0], num_images * figsize[0] / 3)
+    figs, axes = plt.subplots(num_images, 3, figsize=figsize)
+    for ax in axes.flatten():
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.axis('off')
+    for n in range(num_images):
+        heat_img = occlusion_heatmap(
+            net, X[n:n + 1, :, :, :], y[n], square_length
+        )
+
+        ax = axes if num_images == 1 else axes[n]
+        img = X[n, :, :, :].mean(0)
+        ax[0].imshow(-img, interpolation='nearest', cmap='gray')
+        ax[0].set_title('image')
+        ax[1].imshow(-heat_img, interpolation='nearest', cmap='Reds')
+        ax[1].set_title('critical parts')
+        ax[2].imshow(-img, interpolation='nearest', cmap='gray')
+        ax[2].imshow(-heat_img, interpolation='nearest', cmap='Reds',
+                     alpha=0.75)
+        ax[2].set_title('super-imposed')
